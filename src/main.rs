@@ -33,6 +33,8 @@ lazy_static! {
 async fn main() {
     // Initialize the tracing subscriber
     tracing_subscriber::fmt::init();
+    // let subscriber = tracing_subscriber::fmt().json().finish();
+    // tracing::subscriber::set_global_default(subscriber).unwrap();
 
     // Initialize the cache and HTTP client
     let app_state = Arc::new(AppState::new().await);
@@ -101,28 +103,28 @@ async fn handle_request(
     // Check if there is a cached failure
     if let Some(failed_response) = get_from_failed_cache(&state, &cache_key).await {
         if failed_response.elapsed() < CACHE_EXPIRY {
-            info!("declined response to {cache_key} from cache");
+            info!(result = "fail", reason = "cache", server, datafile);
             return StatusCode::BAD_GATEWAY.into_response();
         }
     }
 
     // Check if response is cached in RAM
     if let Some(data) = get_from_ram_cache(&state, &cache_key).await {
-        info!("handled request to {cache_key} from ram cache");
+        info!(result = "success", reason = "ram cache", server, datafile);
         return (StatusCode::OK, data).into_response();
     }
     // Check if response is cached on disk
     if let Some(data) = get_from_disk_cache(&state, &cache_key).await {
-        info!("handled request to {cache_key} from file cache");
+        info!(result = "success", reason = "file cache", server, datafile);
         update_ram_cache(&state, &cache_key, &data).await;
         return (StatusCode::OK, data).into_response();
     }
     // Fetch from the external API
     if let Some(data) = fetch_and_cache(&state, &server, &datafile, &cache_key).await {
-        info!("handled request to {cache_key} from upstream");
+        info!(result = "success", reason = "upstream", server, datafile);
         (StatusCode::OK, data).into_response()
     } else {
-        info!("request to {cache_key} failed from upstream");
+        info!(result = "fail", reason = "upstream", server, datafile);
         StatusCode::BAD_GATEWAY.into_response()
     }
 }
