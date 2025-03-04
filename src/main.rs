@@ -118,15 +118,12 @@ async fn handle_request(
         return (StatusCode::OK, data).into_response();
     }
     // Fetch from the external API
-    match fetch_and_cache(&state, &server, &datafile, &cache_key).await {
-        Ok((status, data)) => {
-            info!("handled request to {cache_key} from upstream");
-            (status, data).into_response()
-        }
-        Err(status) => {
-            info!("request to {cache_key} failed from upstream");
-            status.into_response()
-        }
+    if let Some(data) = fetch_and_cache(&state, &server, &datafile, &cache_key).await {
+        info!("handled request to {cache_key} from upstream");
+        (StatusCode::OK, data).into_response()
+    } else {
+        info!("request to {cache_key} failed from upstream");
+        StatusCode::BAD_GATEWAY.into_response()
     }
 }
 
@@ -174,29 +171,29 @@ async fn fetch_and_cache(
     server: &str,
     datafile: &str,
     cache_key: &str,
-) -> Result<(StatusCode, Bytes), StatusCode> {
+) -> Option<Bytes> {
     let url = format!("https://{server}.grepolis.com/data/{datafile}");
 
     // Perform the HTTP GET request with custom headers
-    let response = if let Ok(resp) = state.client.get(&url).send().await { resp } else {
+    let Ok(response) = state.client.get(&url).send().await else {
         update_failed_cache(state, cache_key).await;
-        return Err(StatusCode::BAD_GATEWAY);
+        return None;
     };
 
     if !response.status().is_success() {
         update_failed_cache(state, cache_key).await;
-        return Err(StatusCode::BAD_GATEWAY);
+        return None;
     }
 
-    let data = if let Ok(b) = response.bytes().await { b } else {
+    let Ok(data) = response.bytes().await else {
         update_failed_cache(state, cache_key).await;
-        return Err(StatusCode::BAD_GATEWAY);
+        return None;
     };
 
     // Update caches
     update_disk_cache(state, cache_key, &data).await;
     update_ram_cache(state, cache_key, &data).await;
-    Ok((StatusCode::OK, data))
+    Some(data)
 }
 
 async fn update_ram_cache(state: &Arc<AppState>, cache_key: &str, data: &Bytes) {
