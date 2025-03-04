@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+
 use axum::{
     body::Body,
     extract::Path,
@@ -9,7 +11,7 @@ use axum::{
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{redirect::Policy, Client};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -17,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{fs, sync::RwLock};
+use tracing::info;
 
 const CACHE_EXPIRY: Duration = Duration::from_secs(15 * 60); // 15 minutes
 const MAX_FILES_IN_RAM_CACHE: usize = 25;
@@ -28,8 +31,12 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() {
+    // Initialize the tracing subscriber
+    tracing_subscriber::fmt::init();
+
     // Initialize the cache and HTTP client
     let app_state = Arc::new(AppState::new().await);
+
     // Build our application with a route
     let app = Router::new()
         .route("/{server}/{datafile}", get(handle_request))
@@ -56,6 +63,7 @@ impl AppState {
             .user_agent("YourCustomUserAgent")
             .gzip(true)
             .deflate(true)
+            .redirect(Policy::none())
             .build()
             .unwrap();
         // Set up the cache directory
@@ -88,29 +96,37 @@ async fn handle_request(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let cache_key = format!("{}/{}", server, datafile);
+    let cache_key = format!("{server}/{datafile}");
 
     // Check if there is a cached failure
     if let Some(failed_response) = get_from_failed_cache(&state, &cache_key).await {
         if failed_response.elapsed() < CACHE_EXPIRY {
+            info!("declined response to {cache_key} from cache");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     }
 
     // Check if response is cached in RAM
     if let Some(data) = get_from_ram_cache(&state, &cache_key).await {
+        info!("handled request to {cache_key} from ram cache");
         return (StatusCode::OK, data).into_response();
     }
     // Check if response is cached on disk
     if let Some(data) = get_from_disk_cache(&state, &cache_key).await {
-        // Update RAM cache
+        info!("handled request to {cache_key} from file cache");
         update_ram_cache(&state, &cache_key, &data).await;
         return (StatusCode::OK, data).into_response();
     }
     // Fetch from the external API
     match fetch_and_cache(&state, &server, &datafile, &cache_key).await {
-        Ok((status, data)) => (status, data).into_response(),
-        Err(status) => status.into_response(), // if we're here it's always BAD_GATEWAY
+        Ok((status, data)) => {
+            info!("handled request to {cache_key} from upstream");
+            (status, data).into_response()
+        }
+        Err(status) => {
+            info!("request to {cache_key} failed from upstream");
+            status.into_response()
+        }
     }
 }
 
@@ -145,7 +161,7 @@ async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<B
 
 async fn get_from_failed_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Instant> {
     let cache = state.failed_cache.read().await;
-    cache.get(cache_key).cloned()
+    cache.get(cache_key).copied()
 }
 
 async fn update_failed_cache(state: &Arc<AppState>, cache_key: &str) {
@@ -159,15 +175,12 @@ async fn fetch_and_cache(
     datafile: &str,
     cache_key: &str,
 ) -> Result<(StatusCode, Bytes), StatusCode> {
-    let url = format!("https://{}.grepolis.com/data/{}", server, datafile);
+    let url = format!("https://{server}.grepolis.com/data/{datafile}");
 
     // Perform the HTTP GET request with custom headers
-    let response = match state.client.get(&url).send().await {
-        Ok(resp) => resp,
-        Err(_) => {
-            update_failed_cache(state, cache_key).await;
-            return Err(StatusCode::BAD_GATEWAY);
-        }
+    let response = if let Ok(resp) = state.client.get(&url).send().await { resp } else {
+        update_failed_cache(state, cache_key).await;
+        return Err(StatusCode::BAD_GATEWAY);
     };
 
     if !response.status().is_success() {
@@ -175,12 +188,9 @@ async fn fetch_and_cache(
         return Err(StatusCode::BAD_GATEWAY);
     }
 
-    let data = match response.bytes().await {
-        Ok(b) => b,
-        Err(_) => {
-            update_failed_cache(state, cache_key).await;
-            return Err(StatusCode::BAD_GATEWAY);
-        }
+    let data = if let Ok(b) = response.bytes().await { b } else {
+        update_failed_cache(state, cache_key).await;
+        return Err(StatusCode::BAD_GATEWAY);
     };
 
     // Update caches
