@@ -44,6 +44,7 @@ async fn main() {
 
 struct AppState {
     cache: RwLock<HashMap<String, CacheEntry>>,
+    failed_cache: RwLock<HashMap<String, Instant>>,
     client: Client,
     cache_dir: PathBuf,
 }
@@ -62,6 +63,7 @@ impl AppState {
         fs::create_dir_all(&cache_dir).await.unwrap();
         Self {
             cache: RwLock::new(HashMap::new()),
+            failed_cache: RwLock::new(HashMap::new()),
             client,
             cache_dir,
         }
@@ -85,7 +87,16 @@ async fn handle_request(
     if !DATAFILE_WHITELIST.contains(&datafile.as_str()) {
         return StatusCode::NOT_FOUND.into_response();
     }
+
     let cache_key = format!("{}/{}", server, datafile);
+
+    // Check if there is a cached failure
+    if let Some(failed_response) = get_from_failed_cache(&state, &cache_key).await {
+        if failed_response.elapsed() < CACHE_EXPIRY {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
+
     // Check if response is cached in RAM
     if let Some(data) = get_from_ram_cache(&state, &cache_key).await {
         return (StatusCode::OK, data).into_response();
@@ -132,6 +143,16 @@ async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<B
     None
 }
 
+async fn get_from_failed_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Instant> {
+    let cache = state.failed_cache.read().await;
+    cache.get(cache_key).cloned()
+}
+
+async fn update_failed_cache(state: &Arc<AppState>, cache_key: &str) {
+    let mut cache = state.failed_cache.write().await;
+    cache.insert(cache_key.to_string(), Instant::now());
+}
+
 async fn fetch_and_cache(
     state: &Arc<AppState>,
     server: &str,
@@ -139,23 +160,32 @@ async fn fetch_and_cache(
     cache_key: &str,
 ) -> Result<(StatusCode, Bytes), StatusCode> {
     let url = format!("https://{}.grepolis.com/data/{}", server, datafile);
+
     // Perform the HTTP GET request with custom headers
-    let response = state
-        .client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let response = match state.client.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(_) => {
+            update_failed_cache(state, cache_key).await;
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
     if !response.status().is_success() {
+        update_failed_cache(state, cache_key).await;
         return Err(StatusCode::BAD_GATEWAY);
     }
-    let data = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let data = match response.bytes().await {
+        Ok(b) => b,
+        Err(_) => {
+            update_failed_cache(state, cache_key).await;
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
     // Update caches
-    update_disk_cache(&state, cache_key, &data).await;
-    update_ram_cache(&state, cache_key, &data).await;
+    update_disk_cache(state, cache_key, &data).await;
+    update_ram_cache(state, cache_key, &data).await;
     Ok((StatusCode::OK, data))
 }
 
