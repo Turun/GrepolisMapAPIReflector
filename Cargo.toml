@@ -12,3 +12,12 @@ reqwest = { version = "0.12.12", features = ["gzip", "deflate"] }
 tokio = { version = "1.43.0", features = ["full"] }
 tracing = { version = "0.1.41", features = ["async-await"] }
 tracing-subscriber = "0.3.19"
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = true
+incremental = false
+opt-level = 3
+overflow-checks = false
+strip = "debuginfo"

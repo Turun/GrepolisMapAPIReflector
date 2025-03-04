@@ -1,4 +1,4 @@
-FROM rust:1.77 AS dependencies
+FROM rust:1.83 AS dependencies
 WORKDIR /app
 COPY Cargo.toml .
 COPY Cargo.lock .
@@ -6,7 +6,7 @@ RUN mkdir -p src
 RUN echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 
-FROM rust:1.77 AS application
+FROM rust:1.83 AS application
 WORKDIR /app
 COPY /Cargo.toml .
 COPY /Cargo.lock .
@@ -15,7 +15,7 @@ COPY --from=dependencies /usr/local/cargo /usr/local/cargo
 COPY src/ src/
 RUN cargo build --release
 
-FROM debian:bullseye-slim AS gregswatch
+FROM debian:bookworm-slim AS runner
 RUN apt-get update
 RUN apt-get install -y ca-certificates 
 RUN rm -rf /var/lib/apt/lists/*
