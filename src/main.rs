@@ -1,5 +1,10 @@
 use axum::{
-    extract::Path, http::StatusCode, response::IntoResponse, routing::get, Extension, Router,
+    body::Body,
+    extract::Path,
+    http::{Response, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Extension, Router,
 };
 use bytes::Bytes;
 use lazy_static::lazy_static;
@@ -27,11 +32,13 @@ async fn main() {
     let app_state = Arc::new(AppState::new().await);
     // Build our application with a route
     let app = Router::new()
-        .route("/:server/:datafile", get(handle_request))
+        .route("/{server}/{datafile}", get(handle_request))
         .layer(Extension(app_state));
 
     // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -69,45 +76,45 @@ struct CacheEntry {
 async fn handle_request(
     Path((server, datafile)): Path<(String, String)>,
     Extension(state): Extension<Arc<AppState>>,
-) -> impl IntoResponse {
+) -> Response<Body> {
     // Validate the server parameter
     if !SERVER_REGEX.is_match(&server) {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     }
     // Validate the datafile parameter
     if !DATAFILE_WHITELIST.contains(&datafile.as_str()) {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     }
     let cache_key = format!("{}/{}", server, datafile);
     // Check if response is cached in RAM
-    if let Some(response) = get_from_ram_cache(&state, &cache_key).await {
-        return response;
+    if let Some(data) = get_from_ram_cache(&state, &cache_key).await {
+        return (StatusCode::OK, data).into_response();
     }
     // Check if response is cached on disk
-    if let Some(response) = get_from_disk_cache(&state, &cache_key).await {
+    if let Some(data) = get_from_disk_cache(&state, &cache_key).await {
         // Update RAM cache
-        update_ram_cache(&state, &cache_key, &response).await;
-        return response;
+        update_ram_cache(&state, &cache_key, &data).await;
+        return (StatusCode::OK, data).into_response();
     }
     // Fetch from the external API
     match fetch_and_cache(&state, &server, &datafile, &cache_key).await {
-        Ok(response) => response,
-        Err(status) => status.into_response(), // if we're here it's always::BAD_GATEWAY
+        Ok((status, data)) => (status, data).into_response(),
+        Err(status) => status.into_response(), // if we're here it's always BAD_GATEWAY
     }
 }
 
-async fn get_from_ram_cache(state: &Arc<AppState>, cache_key: &str) -> Option<impl IntoResponse> {
+async fn get_from_ram_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Bytes> {
     let cache = state.cache.read().await;
     if let Some(entry) = cache.get(cache_key) {
         if entry.timestamp.elapsed() < CACHE_EXPIRY {
             // Cache hit
-            return Some((StatusCode::OK, entry.data.clone()));
+            return Some(entry.data.clone());
         }
     }
     None
 }
 
-async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<impl IntoResponse> {
+async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Bytes> {
     let cache_path = state.cache_dir.join(cache_key);
     if let Ok(metadata) = fs::metadata(&cache_path).await {
         if metadata.is_file() {
@@ -115,7 +122,7 @@ async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<i
                 if let Ok(elapsed) = modified.elapsed() {
                     if elapsed < CACHE_EXPIRY {
                         if let Ok(data) = fs::read(&cache_path).await {
-                            return Some((StatusCode::OK, Bytes::from(data)));
+                            return Some(Bytes::from(data));
                         }
                     }
                 }
@@ -130,7 +137,7 @@ async fn fetch_and_cache(
     server: &str,
     datafile: &str,
     cache_key: &str,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<(StatusCode, Bytes), StatusCode> {
     let url = format!("https://{}.grepolis.com/data/{}", server, datafile);
     // Perform the HTTP GET request with custom headers
     let response = state
@@ -154,7 +161,7 @@ async fn fetch_and_cache(
 
 async fn update_ram_cache(state: &Arc<AppState>, cache_key: &str, data: &Bytes) {
     let mut cache = state.cache.write().await;
-    // If the cache exceeds MAX_SERVERS_IN_RAM, remove the least recently used entry
+    // If the cache exceeds MAX_FILES_IN_RAM_CACHE, remove the least recently used entry
     if cache.len() >= MAX_FILES_IN_RAM_CACHE {
         // Simple LRU implementation
         if let Some(oldest_key) = cache
