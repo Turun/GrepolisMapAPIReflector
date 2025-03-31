@@ -1,4 +1,4 @@
-version: "3.3"  # debian...
+version: "3.5"  # debian...
 services:
   grepolis_api_reflector:
     build: "./"
@@ -10,7 +10,9 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
     restart: "unless-stopped"
+    networks:
+      - internet
 
-# network not required, since we map the port to the host
-# alternatively we could also put this behind caddy
-# for now I'll leave the port mapping in
+networks:
+  internet:
+    name: "internet"
