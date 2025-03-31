@@ -47,8 +47,12 @@ async fn main() {
     // run our app with hyper, listening globally on port 3000
     let listen_address = "[::]:3000";
     info!("listening on {listen_address}");
-    let listener = tokio::net::TcpListener::bind(listen_address).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(listen_address)
+        .await
+        .expect("Failed to build tokio TCP listener");
+    axum::serve(listener, app)
+        .await
+        .expect("Failed to start axum server");
 }
 
 struct AppState {
@@ -67,7 +71,7 @@ impl AppState {
             .deflate(true)
             .redirect(Policy::none())
             .build()
-            .unwrap();
+            .expect("Failed to build reqwest client");
         // Set up the cache directory
         let cache_dir = "./cache".into();
         fs::create_dir_all(&cache_dir).await.unwrap();
